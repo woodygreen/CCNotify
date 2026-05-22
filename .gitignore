@@ -1,0 +1,21 @@
+# runtime data
+db/
+logs/
+
+# config with credentials
+configs/feishu_config.json
+
+# python cache
+__pycache__/
+
+# summary queue (auto-generated)
+summary_queue.json
+
+# images
+*.png
+
+# claude agent worktrees
+.claude/worktrees/
+
+# tmp/debug scripts
+src/tmp_*.py

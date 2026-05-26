@@ -248,9 +248,15 @@ class ClaudePromptTracker:
                     cwd TEXT,
                     seq INTEGER,
                     stoped_at DATETIME,
-                    lastWaitUserAt DATETIME
+                    lastWaitUserAt DATETIME,
+                    cumulative_cost REAL
                 )
             """)
+            # add cumulative_cost column to existing tables
+            try:
+                conn.execute("ALTER TABLE prompt ADD COLUMN cumulative_cost REAL")
+            except sqlite3.OperationalError:
+                pass  # column already exists
             conn.execute("""
                 CREATE TRIGGER IF NOT EXISTS auto_increment_seq
                 AFTER INSERT ON prompt
@@ -327,12 +333,13 @@ class ClaudePromptTracker:
                 # build card content from transcript
                 task_understanding = ""
                 execution_detail = ""
-                display_cost = None
+                display_cost = None          # per-round cost string
+                display_cumulative_cost = None  # session cumulative cost string
                 context_pct = None
                 suggestion = "请检查结果，决定下一步操作"
 
                 if transcript_data:
-                    # task understanding (keep original, AI summary updates via queue)
+                    # task understanding from thinking block
                     raw_understanding = transcript_data.get("task_understanding", "")
                     if raw_understanding:
                         task_understanding = raw_understanding
@@ -345,48 +352,92 @@ class ClaudePromptTracker:
                         transcript_data["max_input_tokens"], transcript_data["model"]
                     )
 
-                    # cost estimation
-                    if not cost_usd:
-                        display_cost = self.estimate_cost(
+                    # cost estimation (cumulative from transcript tokens)
+                    cumulative_cost_val = None
+                    if cost_usd:
+                        cumulative_cost_val = cost_usd
+                    else:
+                        estimated = self.estimate_cost(
                             transcript_data["total_input_tokens"],
                             transcript_data["total_output_tokens"],
                             transcript_data["model"],
                             transcript_data["total_cache_read_tokens"],
                             transcript_data["total_cache_creation_tokens"],
                         )
+                        if estimated != "unknown":
+                            try:
+                                cumulative_cost_val = float(estimated.replace("$", ""))
+                            except ValueError:
+                                cumulative_cost_val = None
+
+                    # get previous cumulative cost for this session to compute per-round
+                    prev_cumulative = 0
+                    cursor = conn.execute(
+                        "SELECT cumulative_cost FROM prompt WHERE session_id = ? AND cumulative_cost IS NOT NULL ORDER BY id DESC LIMIT 1",
+                        (session_id,),
+                    )
+                    prev_row = cursor.fetchone()
+                    if prev_row and prev_row[0]:
+                        prev_cumulative = prev_row[0]
+
+                    if cumulative_cost_val is not None:
+                        per_round_val = cumulative_cost_val - prev_cumulative
+                        display_cost = self.format_cost_value(per_round_val)
+                        display_cumulative_cost = self.format_cost_value(cumulative_cost_val)
+                        # store cumulative cost in DB
+                        conn.execute(
+                            "UPDATE prompt SET cumulative_cost = ? WHERE id = ?",
+                            (cumulative_cost_val, record_id),
+                        )
+                        conn.commit()
+                    elif cost_usd is None and not transcript_data:
+                        display_cost = "unknown"
+                        display_cumulative_cost = "unknown"
+
+                    # handle hook-provided costUSD (cumulative) when no transcript
+                    if cost_usd and not cumulative_cost_val:
+                        cumulative_cost_val = cost_usd
+                        cursor = conn.execute(
+                            "SELECT cumulative_cost FROM prompt WHERE session_id = ? AND cumulative_cost IS NOT NULL ORDER BY id DESC LIMIT 1",
+                            (session_id,),
+                        )
+                        prev_row = cursor.fetchone()
+                        prev_cumulative = prev_row[0] if prev_row and prev_row[0] else 0
+                        per_round_val = cumulative_cost_val - prev_cumulative
+                        display_cost = self.format_cost_value(per_round_val)
+                        display_cumulative_cost = self.format_cost_value(cumulative_cost_val)
+                        conn.execute(
+                            "UPDATE prompt SET cumulative_cost = ? WHERE id = ?",
+                            (cumulative_cost_val, record_id),
+                        )
+                        conn.commit()
 
                     # smart suggestion (keep original, AI summary updates via queue)
                     raw_suggestion = transcript_data.get("last_suggestion", "")
                     if raw_suggestion:
                         suggestion = raw_suggestion
 
-                # prefer hook-provided cost
-                if cost_usd:
-                    if cost_usd < 0.01:
-                        display_cost = f"${cost_usd:.4f}"
-                    elif cost_usd < 1:
-                        display_cost = f"${cost_usd:.2f}"
-                    else:
-                        display_cost = f"${cost_usd:.1f}"
+                # content_lines no longer include duration (moved to badge)
+                content_lines = [f"第 `#{seq}` 轮任务已完成"]
 
                 sent, message_id = self.send_notification(
                     workspace=workspace,
                     notification_type="success",
-                    content_lines=[
-                        f"第 `#{seq}` 轮任务已完成",
-                        f"执行时长: `{duration}`",
-                    ],
+                    content_lines=content_lines,
                     task_understanding=task_understanding,
                     execution_detail=execution_detail,
                     cost=display_cost,
+                    cumulative_cost=display_cumulative_cost,
                     context_pct=context_pct,
                     suggestion=suggestion,
                     model=transcript_data.get("model") if transcript_data else None,
+                    duration=duration,
+                    seq=seq,
                 )
 
                 status = "card sent" if sent else "card send FAILED"
                 logging.info(
-                    f"[{workspace}] job#{seq} done, duration={duration}, cost={display_cost}, msg_id={message_id}, {status}"
+                    f"[{workspace}] job#{seq} done, duration={duration}, cost={display_cost}/{display_cumulative_cost}, msg_id={message_id}, {status}"
                 )
 
                 # save raw data to summary queue for later AI processing
@@ -398,6 +449,7 @@ class ClaudePromptTracker:
                         message_id=message_id,
                         duration=duration,
                         cost=display_cost,
+                        cumulative_cost=display_cumulative_cost,
                         context_pct=context_pct,
                         transcript_data=transcript_data,
                     )
@@ -557,14 +609,14 @@ class ClaudePromptTracker:
         seen_msg_ids = set()
 
         # rich data extraction
-        task_understanding = ""
+        task_understanding = ""   # from thinking block (model's understanding of task)
+        first_thinking_found = False
         last_suggestion = ""
         files_modified = {}   # {basename: {lines_added, lines_removed, edit_count}}
         files_written = []
         files_read = []
         commands_run = []
         decisions = []
-        first_text_found = False
 
         try:
             with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
@@ -610,16 +662,20 @@ class ClaudePromptTracker:
                             if not isinstance(item, dict):
                                 continue
 
+                            # extract thinking content (task understanding source)
+                            if item.get("type") == "thinking":
+                                thinking_text = item.get("thinking", "")
+                                if thinking_text and len(thinking_text) > 15:
+                                    if not first_thinking_found:
+                                        task_understanding = thinking_text
+                                        first_thinking_found = True
+
                             # extract assistant text (reasoning, decisions, suggestions)
-                            if item.get("type") == "text":
+                            elif item.get("type") == "text":
                                 text = item.get("text", "")
-                                if text and len(text) > 15:
-                                    if not first_text_found:
-                                        task_understanding = text
-                                        first_text_found = True
-                                    # collect significant reasoning (skip very short)
-                                    if len(text) > 30:
-                                        decisions.append(text)
+                                if text and len(text) > 30:
+                                    decisions.append(text)
+                                if text:
                                     last_suggestion = text
 
                             # extract tool calls with detail
@@ -785,6 +841,47 @@ class ClaudePromptTracker:
             return text
         return "\n".join([f"{i + 1}. {s}" for i, s in enumerate(segments)])
 
+    def strip_markdown_headers(self, text):
+        """Remove markdown heading markers (# ## ###) and bold markers from text lines.
+        Keeps the text content, just strips the formatting prefixes.
+        """
+        if not text:
+            return text
+        lines = text.split("\n")
+        cleaned = []
+        for line in lines:
+            # strip heading markers: ### title → title
+            stripped = re.sub(r'^#{1,6}\s+', '', line)
+            # strip leading bold markers that act as pseudo-headers: **title** → title
+            # but keep inline bold that's part of a sentence
+            stripped = re.sub(r'^\*\*(.+?)\*\*\s*[：:—–-]?\s*', lambda m: m.group(1) + ' ', stripped)
+            if stripped.strip():
+                cleaned.append(stripped)
+        return "\n".join(cleaned)
+
+    def linkify_urls(self, text):
+        """Convert plain URLs in text to Feishu markdown hyperlink format.
+        https://example.com → [https://example.com](https://example.com)
+        Only targets URLs wrapped in backticks or bare URLs.
+        """
+        if not text:
+            return text
+        # replace backtick-wrapped URLs: `https://...` → [text](url)
+        def replace_backtick_url(m):
+            url = m.group(1)
+            # extract display text from URL (last meaningful path segment or domain)
+            display = re.sub(r'^https?://', '', url)
+            display = display.rstrip('/')
+            # shorten: take domain + last path segment
+            parts = display.split('/')
+            if len(parts) > 2:
+                display = parts[0] + '/' + parts[-1]
+            return f"[{display}]({url})"
+        text = re.sub(r'`(https?://[^\s`]+)`', replace_backtick_url, text)
+        # replace bare URLs not already in a link: https://... → [url](url)
+        text = re.sub(r'(?<!\[(?:.*?\]\())(https?://[^\s<>\)]+)', lambda m: f"[{m.group(0)}]({m.group(0)})", text)
+        return text
+
     def build_execution_detail(self, transcript_data):
         """Build execution detail: files+commands+decisions, one line per item"""
         sections = []
@@ -825,13 +922,17 @@ class ClaudePromptTracker:
                 cmd_lines.append(f"{i + 1}. `{cmd}`")
             sections.append("<font color='orange'>**执行**</font>\n" + "\n".join(cmd_lines))
 
-        # --- decisions section (keep raw English, AI summary comes via queue update) ---
+        # --- decisions section (strip markdown headers, linkify URLs) ---
         decisions = transcript_data.get("decisions", [])
         if decisions:
             significant = sorted(decisions, key=len, reverse=True)[:3]
             decision_lines = []
             for i, d in enumerate(significant):
-                # take first sentence only, keep original (no keyword translation)
+                # strip markdown headings and bold pseudo-headers
+                d = self.strip_markdown_headers(d)
+                # linkify any URLs
+                d = self.linkify_urls(d)
+                # take first line only
                 first = d.split("\n")[0].strip()
                 if not first:
                     first = d[:60]
@@ -842,23 +943,96 @@ class ClaudePromptTracker:
 
         return sections
 
+    def normalize_model_name(self, model):
+        """Normalize model name by stripping date suffix, variant markers, and -latest."""
+        if not model:
+            return model
+        # strip -latest suffix
+        stripped = re.sub(r'-latest$', '', model)
+        # strip @version suffix (used by some providers)
+        stripped = re.sub(r'@[\w-]+$', '', stripped)
+        # strip trailing date suffix: -YYYYMMDD or -YYYY-MM-DD
+        stripped = re.sub(r'-(\d{4})(\d{2})(\d{2})$', '', stripped)
+        stripped = re.sub(r'-(\d{4})-(\d{2})-(\d{2})$', '', stripped)
+        return stripped
+
     def estimate_cost(self, total_input, total_output, model, cache_read=0, cache_creation=0):
         """Estimate cost from token usage based on model pricing (USD per million tokens)"""
         if not model:
-            return None
+            return "unknown"
         pricing = {
+            # --- Anthropic Claude ---
             "claude-opus-4-7": {"input": 15, "output": 75, "cache_read": 1.875, "cache_creation": 18.75},
             "claude-sonnet-4-6": {"input": 3, "output": 15, "cache_read": 0.30, "cache_creation": 3.75},
             "claude-haiku-4-5": {"input": 0.80, "output": 4, "cache_read": 0.08, "cache_creation": 0.80},
-            "glm-5.1": {"input": 15, "output": 75, "cache_read": 1.875, "cache_creation": 18.75},  # proxy alias for opus[1m]
+
+            # --- OpenAI GPT ---
+            "gpt-4.5-preview": {"input": 75, "output": 150, "cache_read": 37.50, "cache_creation": 75},
+            "gpt-4o": {"input": 5, "output": 15, "cache_read": 1.25, "cache_creation": 2.50},
+            "gpt-4o-mini": {"input": 0.15, "output": 0.60, "cache_read": 0.075, "cache_creation": 0.15},
+            "o1": {"input": 15, "output": 60, "cache_read": 7.50, "cache_creation": 15},
+            "o1-mini": {"input": 1.10, "output": 4.40, "cache_read": 0.55, "cache_creation": 1.10},
+            "o3-mini": {"input": 1.10, "output": 4.40, "cache_read": 0.55, "cache_creation": 1.10},
+
+            # --- DeepSeek ---
+            "deepseek-chat": {"input": 0.14, "output": 0.28, "cache_read": 0.014, "cache_creation": 0.14},
+            "deepseek-reasoner": {"input": 0.55, "output": 2.19, "cache_read": 0.14, "cache_creation": 0.55},
+
+            # --- Moonshot Kimi ---
+            "kimi-moonshot-v1-8k": {"input": 1.67, "output": 1.67, "cache_read": 0.17, "cache_creation": 1.67},
+            "kimi-moonshot-v1-32k": {"input": 1.67, "output": 1.67, "cache_read": 0.17, "cache_creation": 1.67},
+            "kimi-moonshot-v1-128k": {"input": 1.67, "output": 1.67, "cache_read": 0.17, "cache_creation": 1.67},
+            "kimi-latest": {"input": 1.67, "output": 1.67, "cache_read": 0.17, "cache_creation": 1.67},
+            "kimi-for-coding": {"input": 2, "output": 2, "cache_read": 0.20, "cache_creation": 2.00},
+            "kimi-k1": {"input": 1.67, "output": 1.67, "cache_read": 0.17, "cache_creation": 1.67},
+            "kimi-k1.5": {"input": 1.67, "output": 1.67, "cache_read": 0.17, "cache_creation": 1.67},
+
+            # --- Alibaba Qwen ---
+            "qwen-max": {"input": 2.40, "output": 4.80, "cache_read": 1.20, "cache_creation": 2.40},
+            "qwen-plus": {"input": 0.80, "output": 2.00, "cache_read": 0.40, "cache_creation": 0.80},
+            "qwen-turbo": {"input": 0.30, "output": 0.60, "cache_read": 0.15, "cache_creation": 0.30},
+            "qwen-coder-plus": {"input": 0.70, "output": 1.40, "cache_read": 0.35, "cache_creation": 0.70},
+            "qwen-coder-turbo": {"input": 0.20, "output": 0.60, "cache_read": 0.10, "cache_creation": 0.20},
+
+            # --- Zhipu GLM ---
+            "glm-5.1": {"input": 15, "output": 75, "cache_read": 1.875, "cache_creation": 18.75},
+            "glm-4": {"input": 1.00, "output": 1.00, "cache_read": 0.10, "cache_creation": 1.00},
+            "glm-4-plus": {"input": 2.00, "output": 2.00, "cache_read": 0.20, "cache_creation": 2.00},
+            "glm-4-flash": {"input": 0.05, "output": 0.05, "cache_read": 0.005, "cache_creation": 0.05},
+            "glm-4-air": {"input": 0.10, "output": 0.10, "cache_read": 0.01, "cache_creation": 0.10},
+
+            # --- MiniMax ---
+            "abab6.5": {"input": 2.40, "output": 2.40, "cache_read": 0.24, "cache_creation": 2.40},
+            "abab6.5s": {"input": 0.80, "output": 0.80, "cache_read": 0.08, "cache_creation": 0.80},
+            "minimax-text-01": {"input": 0.13, "output": 0.13, "cache_read": 0.013, "cache_creation": 0.13},
+
+            # --- Xiaomi ---
+            "xiaomi-mi": {"input": 2.00, "output": 2.00, "cache_read": 0.20, "cache_creation": 2.00},
         }
-        mp = None
-        for key, prices in pricing.items():
-            if model.startswith(key) or key.startswith(model):
-                mp = prices
-                break
+        normalized = self.normalize_model_name(model)
+        mp = pricing.get(normalized)
         if not mp:
-            return None
+            # sort keys by length descending for more specific prefix matches first
+            sorted_keys = sorted(pricing.keys(), key=len, reverse=True)
+            for key in sorted_keys:
+                if normalized.startswith(key) or key.startswith(normalized):
+                    mp = pricing[key]
+                    break
+        if not mp:
+            # unknown model: return token counts as fallback
+            total = total_input + total_output + cache_read + cache_creation
+            if total > 0:
+                parts = []
+                if total_input > 0:
+                    parts.append(f"in:{self._format_token_count(total_input)}")
+                if total_output > 0:
+                    parts.append(f"out:{self._format_token_count(total_output)}")
+                if cache_read > 0:
+                    parts.append(f"cr:{self._format_token_count(cache_read)}")
+                if cache_creation > 0:
+                    parts.append(f"cc:{self._format_token_count(cache_creation)}")
+                return " / ".join(parts) if parts else "unknown"
+            return "unknown"
         cost = (
             total_input / 1_000_000 * mp["input"]
             + total_output / 1_000_000 * mp["output"]
@@ -881,40 +1055,94 @@ class ClaudePromptTracker:
         else:
             return str(tokens)
 
+    def format_cost_value(self, cost_val):
+        """Format a cost value (float in USD) for display"""
+        if cost_val is None:
+            return "unknown"
+        if isinstance(cost_val, str):
+            return cost_val
+        if cost_val < 0.01:
+            return f"${cost_val:.4f}"
+        elif cost_val < 1:
+            return f"${cost_val:.2f}"
+        else:
+            return f"${cost_val:.1f}"
+
     def format_context_pct(self, max_input_tokens, model):
-        """Format context window usage as percentage, with fallback estimation"""
+        """Format context window usage as percentage. Returns 'unknown' for unmatched models."""
         if not max_input_tokens:
             return None
-        # context window sizes (try exact match, then pattern match, then default)
         context_windows = {
+            # --- Anthropic Claude ---
             "claude-opus-4-7": 1_000_000,
             "claude-sonnet-4-6": 200_000,
             "claude-haiku-4-5": 200_000,
-            "glm-5.1": 1_000_000,  # proxy alias for opus[1m]
+
+            # --- OpenAI GPT ---
+            "gpt-4.5-preview": 128_000,
+            "gpt-4o": 128_000,
+            "gpt-4o-mini": 128_000,
+            "o1": 200_000,
+            "o1-mini": 128_000,
+            "o3-mini": 200_000,
+
+            # --- DeepSeek ---
+            "deepseek-chat": 64_000,
+            "deepseek-reasoner": 64_000,
+
+            # --- Moonshot Kimi ---
+            "kimi-moonshot-v1-8k": 8_192,
+            "kimi-moonshot-v1-32k": 32_768,
+            "kimi-moonshot-v1-128k": 131_072,
+            "kimi-latest": 256_000,
+            "kimi-for-coding": 256_000,
+            "kimi-k1": 131_072,
+            "kimi-k1.5": 256_000,
+
+            # --- Alibaba Qwen ---
+            "qwen-max": 32_768,
+            "qwen-plus": 131_072,
+            "qwen-turbo": 131_072,
+            "qwen-coder-plus": 131_072,
+            "qwen-coder-turbo": 131_072,
+
+            # --- Zhipu GLM ---
+            "glm-5.1": 1_000_000,
+            "glm-4": 131_072,
+            "glm-4-plus": 131_072,
+            "glm-4-flash": 131_072,
+            "glm-4-air": 131_072,
+
+            # --- MiniMax ---
+            "abab6.5": 8_192,
+            "abab6.5s": 8_192,
+            "minimax-text-01": 1_000_000,
+
+            # --- Xiaomi ---
+            "xiaomi-mi": 128_000,
         }
+        normalized = self.normalize_model_name(model) if model else None
         ctx_size = None
-        if model:
-            for key, size in context_windows.items():
-                if model.startswith(key) or key.startswith(model):
-                    ctx_size = size
-                    break
-            # fallback: infer from model name keywords
+        if normalized:
+            ctx_size = context_windows.get(normalized)
+            # fallback: sort keys by length descending for more specific prefix matches first
             if not ctx_size:
-                m_lower = model.lower()
-                if "opus" in m_lower:
-                    ctx_size = 1_000_000
-                elif any(k in m_lower for k in ("sonnet", "haiku", "claude")):
-                    ctx_size = 200_000
+                sorted_keys = sorted(context_windows.keys(), key=len, reverse=True)
+                for key in sorted_keys:
+                    if normalized.startswith(key) or key.startswith(normalized):
+                        ctx_size = context_windows[key]
+                        break
         if not ctx_size:
-            # unknown model - use 200K as reasonable default for most LLMs
-            ctx_size = 200_000
+            # unknown model: show raw token count instead of "unknown"
+            return f"{self._format_token_count(max_input_tokens)} used"
         pct = (max_input_tokens / ctx_size) * 100
         return f"{self._format_token_count(max_input_tokens)}/{self._format_token_count(ctx_size)} ({pct:.1f}%)"
 
     def build_feishu_card(self, workspace, notification_type, content_lines,
                           task_understanding=None, execution_detail=None,
-                          cost=None, context_pct=None, suggestion=None,
-                          prompt_summary=None, model=None):
+                          cost=None, cumulative_cost=None, context_pct=None,
+                          suggestion=None, prompt_summary=None, model=None,
+                          duration=None, seq=None):
         """Build Feishu interactive card (schema 2.0) with hr-separated sections and badge row"""
         color_map = {
             "success": "green",
@@ -943,7 +1171,14 @@ class ClaudePromptTracker:
         # --- main content: task info ---
         main_md = "\n".join(content_lines)
         if task_understanding:
-            main_md += f"\n<br><br>\n>**任务理解**\n- {task_understanding}"
+            # strip markdown headers from task understanding, linkify URLs
+            clean_understanding = self.strip_markdown_headers(task_understanding)
+            clean_understanding = self.linkify_urls(clean_understanding)
+            # take first meaningful line (thinking can be long)
+            first_line = clean_understanding.split("\n")[0].strip()
+            if len(first_line) > 80:
+                first_line = first_line[:77] + "..."
+            main_md += f"\n<br><br>\n>**任务理解**\n- {first_line}"
         elif prompt_summary:
             main_md += f"\n<br><br>\n>**任务摘要**\n- `{prompt_summary}`"
 
@@ -981,38 +1216,13 @@ class ClaudePromptTracker:
             })
 
         # --- badge row (column_set) ---
-        # cost color gradient: green < $1, orange $1-5, red > $5
-        cost_color = "grey"
-        if cost:
-            try:
-                cost_val = float(cost.replace("$", ""))
-                if cost_val < 1:
-                    cost_color = "green"
-                elif cost_val < 5:
-                    cost_color = "orange"
-                else:
-                    cost_color = "red"
-            except ValueError:
-                cost_color = "grey"
-        cost_content = f"<font color='{cost_color}'>cost: {cost}</font>" if cost else "<font color='grey'>cost: ---</font>"
+        # new layout: status#seq | duration | model | cost/cumulative | context | timestamp
+        # no label prefixes (model:, cost:, context: removed)
 
-        # context color gradient: green < 30%, orange 30-70%, red > 70%
-        ctx_pct_val = 0
-        ctx_color = "grey"
-        if context_pct:
-            pct_match = re.search(r'([\d.]+)%', context_pct)
-            if pct_match:
-                ctx_pct_val = float(pct_match.group(1))
-            if ctx_pct_val < 30:
-                ctx_color = "green"
-            elif ctx_pct_val < 70:
-                ctx_color = "orange"
-            else:
-                ctx_color = "red"
-        ctx_content = f"<font color='{ctx_color}'> context: {context_pct}</font>" if context_pct else "<font color='grey'> context: ---</font>"
-
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+        # 1. status badge with seq
+        status_text = status_label
+        if seq:
+            status_text = f"{status_label} #{seq}"
         badge_columns = [
             {
                 "tag": "column",
@@ -1021,7 +1231,7 @@ class ClaudePromptTracker:
                 "elements": [
                     {
                         "tag": "markdown",
-                        "content": f"<font color='white'>{status_label}</font>",
+                        "content": f"<font color='white'>{status_text}</font>",
                         "text_align": "center",
                         "text_size": "notation",
                         "margin": "0px 0px 0px 0px",
@@ -1035,84 +1245,153 @@ class ClaudePromptTracker:
                 "vertical_align": "top",
                 "margin": "0px 0px 0px 0px",
             },
-            {
-                "tag": "column",
-                "width": "auto",
-                "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": f"<font color='grey'>model: {model}</font>" if model else "<font color='grey'>model: ---</font>",
-                        "text_align": "center",
-                        "text_size": "notation",
-                        "margin": "0px 0px 0px 0px",
-                    }
-                ],
-                "padding": "0px 8px 0px 8px",
-                "horizontal_spacing": "8px",
-                "vertical_spacing": "0px",
-                "horizontal_align": "left",
-                "vertical_align": "top",
-                "margin": "0px 0px 0px 0px",
-            },
-            {
-                "tag": "column",
-                "width": "auto",
-                "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": cost_content,
-                        "text_align": "center",
-                        "text_size": "notation",
-                        "margin": "0px 0px 0px 0px",
-                    }
-                ],
-                "padding": "0px 8px 0px 8px",
-                "horizontal_spacing": "8px",
-                "vertical_spacing": "0px",
-                "horizontal_align": "left",
-                "vertical_align": "top",
-                "margin": "0px 0px 0px 0px",
-            },
-            {
-                "tag": "column",
-                "width": "auto",
-                "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": ctx_content,
-                        "text_align": "center",
-                        "text_size": "notation",
-                        "margin": "0px 0px 0px 0px",
-                    }
-                ],
-                "padding": "0px 8px 0px 8px",
-                "horizontal_spacing": "8px",
-                "vertical_spacing": "0px",
-                "horizontal_align": "left",
-                "vertical_align": "top",
-                "margin": "0px 0px 0px 0px",
-            },
-            {
-                "tag": "column",
-                "width": "auto",
-                "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": f"<font color='grey'>{current_time}</font>",
-                        "text_align": "center",
-                        "text_size": "notation",
-                        "margin": "0px 0px 0px 0px",
-                    }
-                ],
-                "padding": "0px 8px 0px 8px",
-                "direction": "vertical",
-                "horizontal_spacing": "8px",
-                "vertical_spacing": "8px",
-                "horizontal_align": "left",
-                "vertical_align": "top",
-                "margin": "0px 0px 0px 0px",
-            },
         ]
+
+        # 2. duration badge
+        if duration:
+            badge_columns.append({
+                "tag": "column",
+                "width": "auto",
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": f"<font color='grey'>{duration}</font>",
+                        "text_align": "center",
+                        "text_size": "notation",
+                        "margin": "0px 0px 0px 0px",
+                    }
+                ],
+                "padding": "0px 8px 0px 8px",
+                "horizontal_spacing": "8px",
+                "vertical_spacing": "0px",
+                "horizontal_align": "left",
+                "vertical_align": "top",
+                "margin": "0px 0px 0px 0px",
+            })
+
+        # 3. model badge (normalized, no "model:" prefix)
+        display_model = self.normalize_model_name(model) if model else None
+        badge_columns.append({
+            "tag": "column",
+            "width": "auto",
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"<font color='grey'>{display_model}</font>" if display_model else "<font color='grey'>---</font>",
+                    "text_align": "center",
+                    "text_size": "notation",
+                    "margin": "0px 0px 0px 0px",
+                }
+            ],
+            "padding": "0px 8px 0px 8px",
+            "horizontal_spacing": "8px",
+            "vertical_spacing": "0px",
+            "horizontal_align": "left",
+            "vertical_align": "top",
+            "margin": "0px 0px 0px 0px",
+        })
+
+        # 4. cost badge (per-round/cumulative, no "cost:" prefix)
+        # color based on per-round cost: green < $1, orange $1-5, red > $5
+        cost_color = "grey"
+        cost_display = "---"
+        if cost and cost != "unknown":
+            try:
+                cost_val = float(cost.replace("$", ""))
+                if cost_val < 1:
+                    cost_color = "green"
+                elif cost_val < 5:
+                    cost_color = "orange"
+                else:
+                    cost_color = "red"
+            except ValueError:
+                cost_color = "grey"
+            if cumulative_cost and cumulative_cost != "unknown":
+                cost_display = f"{cost}/{cumulative_cost}"
+            else:
+                cost_display = cost
+        elif cost == "unknown":
+            cost_display = "unknown"
+
+        badge_columns.append({
+            "tag": "column",
+            "width": "auto",
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"<font color='{cost_color}'>{cost_display}</font>",
+                    "text_align": "center",
+                    "text_size": "notation",
+                    "margin": "0px 0px 0px 0px",
+                }
+            ],
+            "padding": "0px 8px 0px 8px",
+            "horizontal_spacing": "8px",
+            "vertical_spacing": "0px",
+            "horizontal_align": "left",
+            "vertical_align": "top",
+            "margin": "0px 0px 0px 0px",
+        })
+
+        # 5. context badge (no "context:" prefix)
+        ctx_color = "grey"
+        ctx_display = "---"
+        if context_pct:
+            ctx_pct_val = 0
+            if context_pct != "unknown":
+                pct_match = re.search(r'([\d.]+)%', context_pct)
+                if pct_match:
+                    ctx_pct_val = float(pct_match.group(1))
+                if ctx_pct_val < 30:
+                    ctx_color = "green"
+                elif ctx_pct_val < 70:
+                    ctx_color = "orange"
+                else:
+                    ctx_color = "red"
+            ctx_display = context_pct
+
+        badge_columns.append({
+            "tag": "column",
+            "width": "auto",
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"<font color='{ctx_color}'>{ctx_display}</font>",
+                    "text_align": "center",
+                    "text_size": "notation",
+                    "margin": "0px 0px 0px 0px",
+                }
+            ],
+            "padding": "0px 8px 0px 8px",
+            "horizontal_spacing": "8px",
+            "vertical_spacing": "0px",
+            "horizontal_align": "left",
+            "vertical_align": "top",
+            "margin": "0px 0px 0px 0px",
+        })
+
+        # 6. timestamp badge
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        badge_columns.append({
+            "tag": "column",
+            "width": "auto",
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"<font color='grey'>{current_time}</font>",
+                    "text_align": "center",
+                    "text_size": "notation",
+                    "margin": "0px 0px 0px 0px",
+                }
+            ],
+            "padding": "0px 8px 0px 8px",
+            "direction": "vertical",
+            "horizontal_spacing": "8px",
+            "vertical_spacing": "8px",
+            "horizontal_align": "left",
+            "vertical_align": "top",
+            "margin": "0px 0px 0px 0px",
+        })
 
         body_elements.append({"tag": "hr", "margin": "0px 0px 0px 0px"})
         body_elements.append({
@@ -1123,7 +1402,7 @@ class ClaudePromptTracker:
             "margin": "0px 0px 0px 0px",
         })
 
-        return {
+        card = {
             "schema": "2.0",
             "config": {
                 "update_multi": True,
@@ -1150,6 +1429,11 @@ class ClaudePromptTracker:
                 "elements": body_elements,
             },
         }
+
+        # log the card content for debuggability
+        logging.info(f"[CARD] task_understanding={task_understanding[:80] if task_understanding else 'None'}, cost={cost}/{cumulative_cost}, model={model}, ctx={context_pct}")
+
+        return card
 
     def get_tenant_access_token(self):
         """Get tenant_access_token via Feishu App API, with local caching"""
@@ -1323,7 +1607,8 @@ class ClaudePromptTracker:
             return False
 
     def save_summary_queue(self, session_id, workspace, seq, message_id,
-                           duration, cost, context_pct, transcript_data):
+                           duration, cost, cumulative_cost=None,
+                           context_pct=None, transcript_data=None):
         """Save raw transcript data to summary queue for later AI processing"""
         queue_path = os.path.join(self.project_dir, "db", "summary_queue.json")
         queue = []
@@ -1341,6 +1626,7 @@ class ClaudePromptTracker:
             "message_id": message_id,
             "duration": duration,
             "cost": cost,
+            "cumulative_cost": cumulative_cost,
             "context_pct": context_pct,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "raw_data": {
@@ -1362,8 +1648,9 @@ class ClaudePromptTracker:
 
     def send_notification(self, workspace, notification_type, content_lines,
                           task_understanding=None, execution_detail=None,
-                          cost=None, context_pct=None, suggestion=None,
-                          prompt_summary=None, model=None):
+                          cost=None, cumulative_cost=None, context_pct=None,
+                          suggestion=None, prompt_summary=None, model=None,
+                          duration=None, seq=None):
         """Send notification via Feishu. Returns (success, message_id)."""
         if not self.send_mode:
             logging.warning(
@@ -1375,7 +1662,8 @@ class ClaudePromptTracker:
         card = self.build_feishu_card(
             workspace, notification_type, content_lines,
             task_understanding, execution_detail,
-            cost, context_pct, suggestion, prompt_summary, model
+            cost, cumulative_cost, context_pct, suggestion, prompt_summary,
+            model, duration, seq
         )
 
         if self.send_mode == "app":
@@ -1458,8 +1746,12 @@ def main():
                 task_understanding=data.get("task_understanding"),
                 execution_detail=data.get("execution_detail"),
                 cost=data.get("cost"),
+                cumulative_cost=data.get("cumulative_cost"),
                 context_pct=data.get("context_pct"),
                 suggestion=data.get("suggestion"),
+                model=data.get("model"),
+                duration=data.get("duration"),
+                seq=data.get("seq"),
             )
 
             success = tracker.update_card(message_id, card)

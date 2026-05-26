@@ -1,6 +1,7 @@
 # runtime data
 db/
 logs/
+ref/
 
 # config with credentials
 configs/feishu_config.json

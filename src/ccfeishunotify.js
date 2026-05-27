@@ -343,10 +343,13 @@ class ClaudePromptTracker {
         const thinking_first = thinking_clean.split("\n")[0].trim().slice(0, 200)
         if (thinking_first) understanding_source += `\n模型理解: ${thinking_first}`
       }
+      let task_ai_processed = false
       if (understanding_source) {
-        // fallback: prompt itself (coherent) is better than keyword-translated garbage
-        const task_fallback = record.prompt ? record.prompt.slice(0, 60) : ""
-        task_understanding = await this.ai_summarize(understanding_source, "task", task_fallback)
+        const task_fallback = this.generate_task_summary_fallback(record.prompt)
+        const result = await this.ai_summarize(understanding_source, "task", task_fallback)
+        task_understanding = result
+        // if result equals fallback, AI didn't actually process it
+        task_ai_processed = result !== task_fallback && result.length > 0
       }
 
       // consolidate and AI-summarize execution steps
@@ -397,10 +400,19 @@ class ClaudePromptTracker {
       }
 
       suggestion = transcript_data.last_suggestion || suggestion
+
+      // override suggestion with last consolidated step's text if it's more conclusive
+      if (transcript_data.consolidated_steps && transcript_data.consolidated_steps.length) {
+        const last_step = transcript_data.consolidated_steps[transcript_data.consolidated_steps.length - 1]
+        if (last_step.text && last_step.text.length > 20) {
+          // last step's text is the actual conclusion, not an intermediate description
+          suggestion = last_step.text
+        }
+      }
     }
 
     // ending classification: determine label (行动建议/总结/结论/汇报)
-    let ending_label = "建议"
+    let ending_label = "结果汇总"
     if (suggestion && suggestion !== "请检查结果，决定下一步操作" && transcript_data) {
       const ending_fallback = `${this.classify_ending_label(suggestion)}：${suggestion.slice(0, 50)}`
       const ending_result = await this.ai_summarize(suggestion.slice(0, 300), "ending", ending_fallback)
@@ -421,11 +433,12 @@ class ClaudePromptTracker {
     this._save_state(state)
 
     const content_lines = [`第 \`#${seq}\` 轮任务已完成`]
-    const result = this.send_notification({
+    const [sent, message_id] = await this.send_notification({
       workspace,
       notification_type: "success",
       content_lines,
       task_understanding,
+      task_ai_processed,
       execution_detail,
       cost: display_cost,
       cumulative_cost: display_cumulative_cost,
@@ -437,16 +450,11 @@ class ClaudePromptTracker {
       seq,
     })
 
-    // async: send_notification returns a promise
-    result.then(([sent, message_id]) => {
-      const status = sent ? "card sent" : "card send FAILED"
-      this._log("info", `[${workspace}] job#${seq} done, duration=${duration}, cost=${display_cost}/${display_cumulative_cost}, msg_id=${message_id}, ${status}`)
-      if (transcript_data && sent) {
-        this.save_summary_queue(session_id, workspace, seq, message_id, duration, display_cost, display_cumulative_cost, context_pct, transcript_data)
-      }
-    }).catch((e) => {
-      this._log("error", `[${workspace}] send_notification failed: ${e.message}`)
-    })
+    const status = sent ? "card sent" : "card send FAILED"
+    this._log("info", `[${workspace}] job#${seq} done, duration=${duration}, cost=${display_cost}/${display_cumulative_cost}, msg_id=${message_id}, ${status}`)
+    if (transcript_data && sent) {
+      this.save_summary_queue(session_id, workspace, seq, message_id, duration, display_cost, display_cumulative_cost, context_pct, transcript_data)
+    }
   }
 
   handle_notification(data) {
@@ -711,6 +719,13 @@ class ClaudePromptTracker {
                 commands_run.push(cmd_text)
                 step_commands.push(cmd_text)
               }
+            } else if (tool_name === "AskUserQuestion" || tool_name === "TodoWrite") {
+              // user-facing question or task tracking: extract as suggestion
+              const questions = tool_input.questions || []
+              if (questions.length) {
+                const q_texts = questions.map((q) => q.question || "").filter(Boolean)
+                if (q_texts.length) last_suggestion = q_texts.join("；")
+              }
             }
           }
         }
@@ -777,7 +792,7 @@ class ClaudePromptTracker {
         "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
       }
-      const { body: result } = await http_request(url, "POST", headers, body_buf, 15000)
+      const { body: result } = await http_request(url, "POST", headers, body_buf, 5000)
       const content_blocks = result.content || []
       if (content_blocks.length > 0) {
         const summary = (content_blocks[0].text || "").trim()
@@ -876,7 +891,12 @@ class ClaudePromptTracker {
         if (action === "edit") {
           const added = f.added || 0
           const removed = f.removed || 0
-          const change_str = removed > 0 ? `+${added}/-${removed}` : `+${added}`
+          let change_str
+          if (removed > 0) {
+            change_str = `**<font color='green'>+${added}</font><font color='red'>/-${removed}</font>**`
+          } else {
+            change_str = `**<font color='green'>+${added}</font>**`
+          }
           file_lines.push(`<font color='yellow'>编辑</font> \`${name}\` ${change_str}`)
         } else if (action === "write") {
           file_lines.push(`<font color='green'>新建</font> \`${name}\``)
@@ -1021,7 +1041,7 @@ class ClaudePromptTracker {
         "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
       }
-      const { body: result } = await http_request(url, "POST", headers, body_buf, 15000)
+      const { body: result } = await http_request(url, "POST", headers, body_buf, 5000)
       const content_blocks = result.content || []
       if (content_blocks.length > 0) {
         const summary_text = (content_blocks[0].text || "").trim()
@@ -1052,35 +1072,65 @@ class ClaudePromptTracker {
 
   _translate_step_desc(step) {
     if (step.user_injection) return `用户补充：${step.user_injection.slice(0, 30)}`
+
+    const files = step.files || []
+    const commands = step.commands || []
+    const actions = files.map((f) => f.action)
+
+    // edit step: show file names for specificity
+    if (actions.includes("edit")) {
+      const edit_names = files.filter((f) => f.action === "edit").map((f) => f.name)
+      if (edit_names.length <= 3) return `修改 ${edit_names.join("、")}`
+      return `修改 ${edit_names.length} 个文件`
+    }
+
+    // write step: show file names
+    if (actions.includes("write")) {
+      const write_names = files.filter((f) => f.action === "write").map((f) => f.name)
+      if (write_names.length <= 3) return `创建 ${write_names.join("、")}`
+      return `创建 ${write_names.length} 个文件`
+    }
+
+    // command step
+    if (commands.length) return "执行操作"
+
+    // read step
+    if (actions.includes("read")) return "调研分析"
+
+    // text/thinking only: show only if short enough to be readable, else generic label
     if (step.thinking) {
       const clean = this.strip_markdown_headers(step.thinking)
-      let first = clean.split("\n")[0].trim()
-      if (first.length > 60) first = first.slice(0, 57) + "..."
-      // keep original text — coherent English is better than garbled keyword translation
-      return first
+      const first = clean.split("\n")[0].trim()
+      if (first.length <= 30) return first
+      return "分析思考"
     }
     if (step.text) {
       const clean = this.strip_markdown_headers(step.text)
-      let first = clean.split("\n")[0].trim()
-      if (first.length > 60) first = first.slice(0, 57) + "..."
-      return first
+      const first = clean.split("\n")[0].trim()
+      if (first.length <= 30) return first
+      return "输出结果"
     }
-    const actions = (step.files || []).map((f) => f.action)
-    if (actions.includes("edit")) return "修改代码"
-    if (actions.includes("write")) return "创建文件"
-    if (actions.includes("read")) return "调研分析"
+
     return "处理任务"
   }
 
   classify_ending_label(text) {
-    if (!text) return "建议"
+    if (!text) return "结果汇总"
     const lower = text.toLowerCase()
-    if (/conclusion|therefore|thus|结果|结论/.test(lower)) return "结论"
+    if (/conclusion|therefore|thus|结论/.test(lower)) return "结论"
     if (/summary|overview|总结|回顾/.test(lower)) return "总结"
     if (/report|progress|汇报|进展/.test(lower)) return "汇报"
-    if (/suggest|recommend|should|next|建议|请|下一步/.test(lower)) return "行动建议"
-    if (/done|completed|finished|完成/.test(lower)) return "完成总结"
-    return "建议"
+    if (/suggest|recommend|should|next|请|下一步/.test(lower)) return "行动建议"
+    // completed task: default to 结果汇总
+    return "结果汇总"
+  }
+
+  generate_task_summary_fallback(prompt) {
+    if (!prompt) return ""
+    const trimmed = prompt.trim()
+    // show full prompt if short enough, otherwise truncate whole text
+    if (trimmed.length <= 60) return trimmed
+    return trimmed.slice(0, 57) + "..."
   }
 
   normalize_model_name(model) {
@@ -1268,7 +1318,7 @@ class ClaudePromptTracker {
   build_feishu_card(opts) {
     const {
       workspace, notification_type, content_lines,
-      task_understanding, execution_detail,
+      task_understanding, task_ai_processed, execution_detail,
       cost, cumulative_cost, context_pct,
       suggestion, ending_label, prompt_summary, model,
       duration, seq,
@@ -1284,7 +1334,8 @@ class ClaudePromptTracker {
     // main content
     let main_md = content_lines.join("\n")
     if (task_understanding) {
-      main_md += `\n<br><br>\n>**任务理解**\n- ${task_understanding}`
+      const label = task_ai_processed ? "任务AI理解" : "任务理解"
+      main_md += `\n<br><br>\n>**${label}**\n- ${task_understanding}`
     } else if (prompt_summary) {
       main_md += `\n<br><br>\n>**任务摘要**\n- \`${prompt_summary}\``
     }

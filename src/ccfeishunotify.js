@@ -158,7 +158,9 @@ function http_request(url_str, method, headers, body_buf, timeout_ms) {
 }
 
 function now_iso() {
-  return new Date().toISOString().replace("T", " ").replace(/\.\d+Z$/, "")
+  // UTC+8 timestamp
+  const d = new Date(Date.now() + 8 * 3600000)
+  return d.toISOString().replace("T", " ").replace(/\.\d+Z$/, "")
 }
 
 class ClaudePromptTracker {
@@ -299,7 +301,7 @@ class ClaudePromptTracker {
     this._log("info", `Recorded prompt for session ${session_id}`)
   }
 
-  handle_stop(data) {
+  async handle_stop(data) {
     const session_id = data.session_id || ""
     const cost_usd = data.costUSD
 
@@ -332,7 +334,30 @@ class ClaudePromptTracker {
 
     if (transcript_data) {
       const model = transcript_data.model || this.cc_switch_model
-      task_understanding = transcript_data.task_understanding || ""
+
+      // task understanding: combine prompt + thinking, AI-summarize into Chinese
+      let understanding_source = ""
+      if (record.prompt) understanding_source = `用户输入: ${record.prompt}`
+      if (transcript_data.task_understanding) {
+        const thinking_clean = this.strip_markdown_headers(transcript_data.task_understanding)
+        const thinking_first = thinking_clean.split("\n")[0].trim().slice(0, 200)
+        if (thinking_first) understanding_source += `\n模型理解: ${thinking_first}`
+      }
+      if (understanding_source) {
+        // fallback: prompt itself (coherent) is better than keyword-translated garbage
+        const task_fallback = record.prompt ? record.prompt.slice(0, 60) : ""
+        task_understanding = await this.ai_summarize(understanding_source, "task", task_fallback)
+      }
+
+      // consolidate and AI-summarize execution steps
+      const steps = transcript_data.steps || []
+      if (steps.length) {
+        const consolidated = this._consolidate_steps(steps)
+        const step_summaries = await this.ai_summarize_steps(consolidated)
+        transcript_data.consolidated_steps = consolidated
+        transcript_data.step_summaries = step_summaries
+      }
+
       execution_detail = this.build_execution_detail(transcript_data)
       context_pct = this.format_context_pct(transcript_data.max_input_tokens, model)
 
@@ -374,6 +399,25 @@ class ClaudePromptTracker {
       suggestion = transcript_data.last_suggestion || suggestion
     }
 
+    // ending classification: determine label (行动建议/总结/结论/汇报)
+    let ending_label = "建议"
+    if (suggestion && suggestion !== "请检查结果，决定下一步操作" && transcript_data) {
+      const ending_fallback = `${this.classify_ending_label(suggestion)}：${suggestion.slice(0, 50)}`
+      const ending_result = await this.ai_summarize(suggestion.slice(0, 300), "ending", ending_fallback)
+      if (ending_result) {
+        // parse format like "行动建议：xxx" or "总结：xxx"
+        const valid_labels = ["行动建议", "总结", "结论", "汇报", "完成总结"]
+        const matched = valid_labels.find((l) => ending_result.startsWith(l))
+        if (matched) {
+          ending_label = matched
+          const rest = ending_result.slice(matched.length).replace(/^[：:]/, "").trim()
+          if (rest) suggestion = rest
+        } else {
+          ending_label = this.classify_ending_label(suggestion)
+        }
+      }
+    }
+
     this._save_state(state)
 
     const content_lines = [`第 \`#${seq}\` 轮任务已完成`]
@@ -387,6 +431,7 @@ class ClaudePromptTracker {
       cumulative_cost: display_cumulative_cost,
       context_pct,
       suggestion,
+      ending_label,
       model: transcript_data ? (transcript_data.model || this.cc_switch_model) : this.cc_switch_model,
       duration,
       seq,
@@ -523,6 +568,7 @@ class ClaudePromptTracker {
     let model = null
     const seen_msg_ids = new Set()
 
+    // flat structures (backward compat for summary queue)
     let task_understanding = ""
     let first_thinking_found = false
     let last_suggestion = ""
@@ -533,11 +579,34 @@ class ClaudePromptTracker {
     const commands_run = []
     const decisions = []
 
+    // chronological steps (new)
+    const steps = []
+
     try {
       const lines = fs.readFileSync(transcript_path, "utf-8").split("\n")
       for (const line of lines) {
         let data
         try { data = JSON.parse(line) } catch { continue }
+
+        if (data.type === "user") {
+          // user messages: track mid-conversation injections
+          const msg = data.message
+          if (!msg) continue
+          let user_text = ""
+          const content = msg.content
+          if (typeof content === "string") {
+            user_text = content
+          } else if (Array.isArray(content)) {
+            for (const item of content) {
+              if (item && item.type === "text" && item.text) user_text += item.text + " "
+            }
+          }
+          if (user_text.trim() && steps.length > 0) {
+            // mid-conversation injection (not the initial prompt)
+            steps.push({ files: [], commands: [], thinking: "", text: "", user_injection: user_text.trim().slice(0, 200) })
+          }
+          continue
+        }
 
         if (data.type !== "assistant") continue
         const msg = data.message
@@ -563,6 +632,12 @@ class ClaudePromptTracker {
           if (it > max_input_tokens) max_input_tokens = it
         }
 
+        // step-level data for this message
+        const step_files = []
+        const step_commands = []
+        let step_thinking = ""
+        let step_text = ""
+
         // extract content details
         const content = msg.content
         if (!Array.isArray(content)) continue
@@ -570,19 +645,25 @@ class ClaudePromptTracker {
         for (const item of content) {
           if (!item || typeof item !== "object") continue
 
-          // thinking block → task understanding
+          // thinking block
           if (item.type === "thinking") {
             const thinking_text = item.thinking || ""
-            if (thinking_text && thinking_text.length > 15 && !first_thinking_found) {
-              task_understanding = thinking_text
-              first_thinking_found = true
+            if (thinking_text && thinking_text.length > 15) {
+              step_thinking = thinking_text
+              if (!first_thinking_found) {
+                task_understanding = thinking_text
+                first_thinking_found = true
+              }
             }
           }
           // text block → decisions and suggestion
           else if (item.type === "text") {
             const text = item.text || ""
             if (text && text.length > 30) decisions.push(text)
-            if (text) last_suggestion = text
+            if (text) {
+              step_text = text
+              last_suggestion = text
+            }
           }
           // tool_use block
           else if (item.type === "tool_use") {
@@ -596,15 +677,22 @@ class ClaudePromptTracker {
               const basename = path.basename(fp) || "unknown"
               const old_lines = old_str ? old_str.split("\n").length : 0
               const new_lines = new_str ? new_str.split("\n").length : 0
+              // flat structure (backward compat)
               if (!files_modified[basename]) {
                 files_modified[basename] = { lines_added: 0, lines_removed: 0, edit_count: 0 }
               }
               files_modified[basename].lines_added += new_lines
               files_modified[basename].lines_removed += old_lines
               files_modified[basename].edit_count += 1
+              // step structure
+              step_files.push({ name: basename, action: "edit", added: new_lines, removed: old_lines })
             } else if (tool_name === "Write") {
               const fp = tool_input.file_path || ""
-              if (fp) files_written.push(path.basename(fp))
+              if (fp) {
+                const basename = path.basename(fp)
+                files_written.push(basename)
+                step_files.push({ name: basename, action: "write" })
+              }
             } else if (["Read", "Grep", "Glob"].includes(tool_name)) {
               const fp = tool_input.file_path || ""
               if (fp) {
@@ -613,14 +701,23 @@ class ClaudePromptTracker {
                   files_read_set.add(basename)
                   files_read.push(basename)
                 }
+                step_files.push({ name: basename, action: "read" })
               }
             } else if (["Bash", "PowerShell"].includes(tool_name)) {
               const desc = tool_input.description || ""
               const cmd = tool_input.command || ""
-              if (desc && desc.length > 3) commands_run.push(desc)
-              else if (cmd) commands_run.push(cmd)
+              const cmd_text = (desc && desc.length > 3) ? desc : cmd
+              if (cmd_text) {
+                commands_run.push(cmd_text)
+                step_commands.push(cmd_text)
+              }
             }
           }
+        }
+
+        // add step if it has meaningful content
+        if (step_files.length || step_commands.length || (step_thinking && step_thinking.length > 15) || (step_text && step_text.length > 30)) {
+          steps.push({ files: step_files, commands: step_commands, thinking: step_thinking, text: step_text })
         }
       }
     } catch (e) {
@@ -629,19 +726,12 @@ class ClaudePromptTracker {
     }
 
     return {
-      task_understanding,
-      decisions,
-      last_suggestion,
-      files_modified,
-      files_written,
-      files_read,
-      commands_run,
-      total_input_tokens,
-      total_output_tokens,
-      total_cache_read_tokens,
-      total_cache_creation_tokens,
-      max_input_tokens,
-      model,
+      task_understanding, decisions, last_suggestion,
+      files_modified, files_written, files_read, commands_run,
+      steps,
+      total_input_tokens, total_output_tokens,
+      total_cache_read_tokens, total_cache_creation_tokens,
+      max_input_tokens, model,
     }
   }
 
@@ -658,10 +748,17 @@ class ClaudePromptTracker {
     }
 
     const prompts = {
-      task: "将以下内容用一句精简的中文概括任务目标，言简意赅，不要啰嗦，不要省略号",
+      task: "根据以下用户输入和模型理解，用一句精简的中文概括这个任务的核心目标和意图。" +
+        "优先提取模型理解中的关键信息，结合用户输入补充上下文。" +
+        "言简意赅，不超过30字，不要省略号。",
       command: "将以下命令描述用一句精简中文概括做了什么，言简意赅",
       decision: "将以下推理内容用一句精简中文概括核心决策，言简意赅，只说结论",
-      suggestion: "将以下建议用一句精简中文概括，言简意赅",
+      ending: "判断以下内容的性质并概括为精简中文。" +
+        "如果是后续操作建议，格式：'行动建议：xxx'。" +
+        "如果是工作总结，格式：'总结：xxx'。" +
+        "如果是分析结论，格式：'结论：xxx'。" +
+        "如果是阶段性汇报，格式：'汇报：xxx'。" +
+        "言简意赅，不超过30字。",
       change: "将以下代码改动用精简中文逐条概括每项改动的目的，用编号列表格式，每条言简意赅",
       general: "将以下内容用一句精简的中文概括，言简意赅",
     }
@@ -754,62 +851,236 @@ class ClaudePromptTracker {
 
   // --- Card building ---
   build_execution_detail(transcript_data) {
+    const consolidated = transcript_data.consolidated_steps || []
+    const summaries = transcript_data.step_summaries || []
+
+    if (!consolidated.length) return []
+
     const sections = []
+    for (let i = 0; i < consolidated.length; i++) {
+      const step = consolidated[i]
 
-    // files section
-    const file_lines = []
-    const files_mod = transcript_data.files_modified || {}
-    for (const fname in files_mod) {
-      const info = files_mod[fname]
-      const added = info.lines_added
-      const removed = info.lines_removed
-      const edit_count = info.edit_count
-      const change_str = removed > 0 ? `+${added}/-${removed}` : `+${added}`
-      file_lines.push(`<font color='green'>编辑</font> \`${fname}\` ${change_str} ${edit_count}处`)
-    }
+      // user injection step — show separately
+      if (step.user_injection) {
+        sections.push(`<font color='blue'>**用户补充**</font>：${step.user_injection.slice(0, 80)}`)
+        continue
+      }
 
-    const written = transcript_data.files_written || []
-    const written_set = new Set(written)
-    for (const fname of written_set) {
-      if (!files_mod[fname]) file_lines.push(`<font color='green'>新建</font> \`${fname}\``)
-    }
+      const step_desc = i < summaries.length ? summaries[i] : this._translate_step_desc(step)
 
-    const files_read = transcript_data.files_read || []
-    for (const fname of files_read.slice(0, 8)) {
-      file_lines.push(`<font color='grey'>读取</font> \`${fname}\``)
-    }
-    if (files_read.length > 8) {
-      file_lines.push(`<font color='grey'>读取</font> 等${files_read.length}个文件`)
-    }
+      // file operations (chronological within step, colored by action type)
+      const file_lines = []
+      for (const f of (step.files || [])) {
+        const action = f.action || "read"
+        const name = f.name || ""
+        if (action === "edit") {
+          const added = f.added || 0
+          const removed = f.removed || 0
+          const change_str = removed > 0 ? `+${added}/-${removed}` : `+${added}`
+          file_lines.push(`<font color='yellow'>编辑</font> \`${name}\` ${change_str}`)
+        } else if (action === "write") {
+          file_lines.push(`<font color='green'>新建</font> \`${name}\``)
+        } else if (action === "read") {
+          file_lines.push(`<font color='grey'>读取</font> \`${name}\``)
+        }
+      }
 
-    if (file_lines.length) {
-      sections.push("<font color='wathet'>**文件**</font>\n" + file_lines.join("\n"))
-    }
+      // commands (translated to Chinese)
+      const cmd_lines = []
+      for (const cmd of (step.commands || [])) {
+        cmd_lines.push(`\`${this.translate_to_chinese(cmd)}\``)
+      }
 
-    // commands section
-    const commands = transcript_data.commands_run || []
-    if (commands.length) {
-      const unique_cmds = [...new Set(commands)].slice(0, 5)
-      const cmd_lines = unique_cmds.map((cmd, i) => `${i + 1}. \`${cmd}\``)
-      sections.push("<font color='orange'>**执行**</font>\n" + cmd_lines.join("\n"))
-    }
+      // combine into section
+      const parts = []
+      if (step_desc) {
+        parts.push(`**第${i + 1}步：${step_desc}**`)
+      } else {
+        const actions = (step.files || []).map((f) => f.action)
+        if (actions.includes("edit")) parts.push(`**第${i + 1}步：修改代码**`)
+        else if (actions.includes("write")) parts.push(`**第${i + 1}步：创建文件**`)
+        else if (actions.includes("read")) parts.push(`**第${i + 1}步：调研分析**`)
+        else parts.push(`**第${i + 1}步**`)
+      }
 
-    // decisions section (strip markdown headers, linkify URLs)
-    const decisions = transcript_data.decisions || []
-    if (decisions.length) {
-      const significant = [...decisions].sort((a, b) => b.length - a.length).slice(0, 3)
-      const decision_lines = significant.map((d, i) => {
-        d = this.strip_markdown_headers(d)
-        d = this.linkify_urls(d)
-        let first = d.split("\n")[0].trim()
-        if (!first) first = d.slice(0, 60)
-        else if (first.length > 60) first = first.slice(0, 57) + "..."
-        return `${i + 1}. ${first}`
-      })
-      sections.push("<font color='purple'>**决策**</font>\n" + decision_lines.join("\n"))
+      if (file_lines.length) parts.push(file_lines.join("\n"))
+      if (cmd_lines.length) parts.push(cmd_lines.join("\n"))
+
+      const section_content = parts.join("\n")
+      if (section_content.trim()) sections.push(section_content)
     }
 
     return sections
+  }
+
+  _consolidate_steps(steps, limit = 6) {
+    const consolidated = []
+    const pending_reads = []
+
+    for (const step of steps) {
+      const has_edits = (step.files || []).some((f) => f.action === "edit")
+      const has_writes = (step.files || []).some((f) => f.action === "write")
+      const has_commands = (step.commands || []).length > 0
+
+      if (has_edits || has_writes || has_commands) {
+        // attach pending reads to this significant step
+        if (pending_reads.length) {
+          const read_names = []
+          for (const rs of pending_reads) {
+            for (const f of (rs.files || [])) {
+              if (f.action === "read" && !read_names.includes(f.name)) read_names.push(f.name)
+            }
+          }
+          if (read_names.length) {
+            const existing_names = (step.files || []).map((f) => f.name)
+            const read_entries = read_names.filter((n) => !existing_names.includes(n)).map((n) => ({ name: n, action: "read" }))
+            step.files = read_entries.concat(step.files || [])
+          }
+          // use thinking from pending reads if step has none
+          if (!step.thinking) {
+            for (const rs of pending_reads) {
+              if (rs.thinking) { step.thinking = rs.thinking; break }
+            }
+          }
+          pending_reads.length = 0
+        }
+        consolidated.push(step)
+      } else {
+        pending_reads.push(step)
+      }
+    }
+
+    // remaining reads without any significant step
+    if (pending_reads.length) {
+      const read_names = []
+      for (const rs of pending_reads) {
+        for (const f of (rs.files || [])) {
+          if (f.action === "read" && !read_names.includes(f.name)) read_names.push(f.name)
+        }
+      }
+      if (read_names.length) {
+        consolidated.push({ files: read_names.map((n) => ({ name: n, action: "read" })), commands: [], thinking: "", text: "" })
+      }
+    }
+
+    return consolidated.slice(0, limit)
+  }
+
+  async ai_summarize_steps(steps) {
+    const cfg = this.config
+    const base_url = cfg.ai_base_url
+    const api_key = cfg.ai_api_key
+    const model = cfg.ai_model || "claude-sonnet-4-6"
+
+    if (!base_url || !api_key) {
+      return steps.map((step) => this._translate_step_desc(step))
+    }
+
+    // build combined input text
+    let raw_text = ""
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i]
+      const parts = []
+      if (step.user_injection) {
+        parts.push(`用户补充消息: ${step.user_injection.slice(0, 100)}`)
+      }
+      if (step.thinking) {
+        const clean = this.strip_markdown_headers(step.thinking)
+        const first = clean.split("\n")[0].trim().slice(0, 200)
+        parts.push(first)
+      }
+      if (step.text && !parts.length) {
+        const clean = this.strip_markdown_headers(step.text)
+        const first = clean.split("\n")[0].trim().slice(0, 200)
+        parts.push(first)
+      }
+      for (const f of (step.files || [])) {
+        const action_zh = { edit: "编辑", write: "新建", read: "读取" }[f.action] || "操作"
+        parts.push(`${action_zh} ${f.name || ""}`)
+      }
+      for (const cmd of (step.commands || [])) {
+        parts.push(cmd.slice(0, 100))
+      }
+      raw_text += `步骤${i + 1}: ${parts.join(" | ")}\n`
+    }
+
+    const sys_prompt = "将以下执行步骤逐条概括为精简中文，每条一行，格式为'第X步：中文概括'。" +
+      "面向非技术人员，用通俗语言解释每步做了什么、为什么做。" +
+      "言简意赅，每条不超过30字。只输出概括列表，不要其他内容。"
+
+    try {
+      const url = `${base_url}/v1/messages`
+      const payload = {
+        model,
+        max_tokens: 300,
+        messages: [{ role: "user", content: `${sys_prompt}\n\n${raw_text}` }],
+      }
+      const body_buf = Buffer.from(JSON.stringify(payload), "utf-8")
+      const headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+      }
+      const { body: result } = await http_request(url, "POST", headers, body_buf, 15000)
+      const content_blocks = result.content || []
+      if (content_blocks.length > 0) {
+        const summary_text = (content_blocks[0].text || "").trim()
+        const descriptions = []
+        for (const line of summary_text.split("\n")) {
+          const trimmed = line.trim()
+          if (trimmed) {
+            let desc = trimmed.replace(/^第\d+步[：:]\s*/, "")
+            desc = desc.replace(/^\d+[\.。、]\s*/, "")
+            if (desc) descriptions.push(desc)
+          }
+        }
+        if (descriptions.length >= steps.length) {
+          return descriptions.slice(0, steps.length)
+        }
+        // pad missing descriptions with fallback
+        while (descriptions.length < steps.length) {
+          descriptions.push(this._translate_step_desc(steps[descriptions.length]))
+        }
+        return descriptions
+      }
+    } catch (e) {
+      this._log("warning", `AI step summarization failed: ${e.message}`)
+    }
+
+    return steps.map((step) => this._translate_step_desc(step))
+  }
+
+  _translate_step_desc(step) {
+    if (step.user_injection) return `用户补充：${step.user_injection.slice(0, 30)}`
+    if (step.thinking) {
+      const clean = this.strip_markdown_headers(step.thinking)
+      let first = clean.split("\n")[0].trim()
+      if (first.length > 60) first = first.slice(0, 57) + "..."
+      // keep original text — coherent English is better than garbled keyword translation
+      return first
+    }
+    if (step.text) {
+      const clean = this.strip_markdown_headers(step.text)
+      let first = clean.split("\n")[0].trim()
+      if (first.length > 60) first = first.slice(0, 57) + "..."
+      return first
+    }
+    const actions = (step.files || []).map((f) => f.action)
+    if (actions.includes("edit")) return "修改代码"
+    if (actions.includes("write")) return "创建文件"
+    if (actions.includes("read")) return "调研分析"
+    return "处理任务"
+  }
+
+  classify_ending_label(text) {
+    if (!text) return "建议"
+    const lower = text.toLowerCase()
+    if (/conclusion|therefore|thus|结果|结论/.test(lower)) return "结论"
+    if (/summary|overview|总结|回顾/.test(lower)) return "总结"
+    if (/report|progress|汇报|进展/.test(lower)) return "汇报"
+    if (/suggest|recommend|should|next|建议|请|下一步/.test(lower)) return "行动建议"
+    if (/done|completed|finished|完成/.test(lower)) return "完成总结"
+    return "建议"
   }
 
   normalize_model_name(model) {
@@ -999,7 +1270,7 @@ class ClaudePromptTracker {
       workspace, notification_type, content_lines,
       task_understanding, execution_detail,
       cost, cumulative_cost, context_pct,
-      suggestion, prompt_summary, model,
+      suggestion, ending_label, prompt_summary, model,
       duration, seq,
     } = opts
 
@@ -1013,11 +1284,7 @@ class ClaudePromptTracker {
     // main content
     let main_md = content_lines.join("\n")
     if (task_understanding) {
-      let clean = this.strip_markdown_headers(task_understanding)
-      clean = this.linkify_urls(clean)
-      let first_line = clean.split("\n")[0].trim()
-      if (first_line.length > 80) first_line = first_line.slice(0, 77) + "..."
-      main_md += `\n<br><br>\n>**任务理解**\n- ${first_line}`
+      main_md += `\n<br><br>\n>**任务理解**\n- ${task_understanding}`
     } else if (prompt_summary) {
       main_md += `\n<br><br>\n>**任务摘要**\n- \`${prompt_summary}\``
     }
@@ -1034,10 +1301,11 @@ class ClaudePromptTracker {
       }
     }
 
-    // suggestion
+    // ending section (dynamic label)
     if (suggestion) {
       body_elements.push({ tag: "hr", margin: "0px 0px 0px 0px" })
-      body_elements.push({ tag: "markdown", content: `>**建议**\n${suggestion}`, text_align: "left", text_size: "normal_v2", margin: "0px 0px 0px 0px" })
+      const label = ending_label || "建议"
+      body_elements.push({ tag: "markdown", content: `>**${label}**\n${suggestion}`, text_align: "left", text_size: "normal_v2", margin: "0px 0px 0px 0px" })
     }
 
     // badge row

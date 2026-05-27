@@ -2,19 +2,23 @@
 
 CCFeishuNotify provides Feishu (Lark) notifications for Claude Code, alerting you when Claude needs your input or completes tasks. Based on CCNotify.
 
-**Cross-platform**: Works on Windows, macOS, and Linux (no macOS desktop notification dependency).
+**Cross-platform**: Works on Windows, macOS, and Linux. **Node.js only** — zero external dependencies.
 
 ## Features
 
-- Task completion notification with duration and prompt summary
+- Task completion notification with duration and AI-summarized Chinese task understanding
+- Step-by-step execution detail organized chronologically (not by file/command/decision type)
+- AI-generated Chinese descriptions for each step (accessible to non-technical readers)
 - Permission/action required notification with color-coded cards
-- Feishu interactive card messages with rich formatting (project, path, timestamp)
+- Feishu interactive card messages with rich formatting
 - Two sending modes: App API (tenant_access_token) and Webhook (custom bot)
-- Local SQLite session tracking (no data uploaded externally)
+- JSON-based session tracking (no SQLite dependency)
+- Auto-register hooks for cc-switch compatibility
+- UTC+8 timestamps
 
 ## Important Notes
 
-Starting from claude-code v1.0.95 (2025-08-31), any invalid settings in `~/.claude/settings.json` will disable hooks. See [Why not working](#why-not-working) for solutions.
+Starting from claude-code v1.0.95 (2025-08-31), any invalid settings in `~/.claude/settings.json` will disable hooks. The script auto-registers hooks on every invocation to prevent loss.
 
 ## Configuration
 
@@ -33,7 +37,10 @@ Create `configs/feishu_config.json` (under the project root):
   "receive_id": "ou_your_open_id",
   "receive_id_type": "open_id",
   "webhook_url": "",
-  "webhook_secret": ""
+  "webhook_secret": "",
+  "ai_base_url": "https://api.anthropic.com",
+  "ai_api_key": "sk-ant-xxx",
+  "ai_model": "claude-sonnet-4-6"
 }
 ```
 
@@ -71,6 +78,8 @@ All config fields can be overridden via environment variables (takes priority ov
 - `FEISHU_APP_SECRET`
 - `FEISHU_RECEIVE_ID`
 - `FEISHU_RECEIVE_ID_TYPE`
+- `ANTHROPIC_BASE_URL` (for AI task/step summarization)
+- `ANTHROPIC_API_KEY` (for AI task/step summarization)
 
 ## Installation Guide
 
@@ -79,12 +88,11 @@ All config fields can be overridden via environment variables (takes priority ov
 **macOS/Linux**:
 ```bash
 mkdir -p ~/.claude/ccfeishunotify/{src,configs,db,logs}
-ln -f src/ccfeishunotify.py ~/.claude/ccfeishunotify/src/
-ln -f configs/feishu_config.json ~/.claude/ccfeishunotify/configs/
-chmod a+x ~/.claude/ccfeishunotify/src/ccfeishunotify.py
+cp src/ccfeishunotify.js ~/.claude/ccfeishunotify/src/
+cp configs/feishu_config.json ~/.claude/ccfeishunotify/configs/
 
-# verify installation
-python ~/.claude/ccfeishunotify/src/ccfeishunotify.py
+# verify installation (also auto-registers hooks)
+node ~/.claude/ccfeishunotify/src/ccfeishunotify.js
 # should print: ok
 ```
 
@@ -92,28 +100,17 @@ python ~/.claude/ccfeishunotify/src/ccfeishunotify.py
 ```powershell
 $dest = "$env:USERPROFILE\.claude\ccfeishunotify"
 New-Item -ItemType Directory -Force -Path "$dest\src","$dest\configs","$dest\db","$dest\logs"
-Copy-Item src\ccfeishunotify.py "$dest\src\"
+Copy-Item src\ccfeishunotify.js "$dest\src\"
 Copy-Item configs\feishu_config.json "$dest\configs\"
 
-# verify installation
-python "$dest\src\ccfeishunotify.py"
+# verify installation (also auto-registers hooks)
+node "$dest\src\ccfeishunotify.js"
 # should print: ok
 ```
 
 ### 2. Configure Feishu Credentials
 
-Copy `configs/feishu_config.example.json` to `configs/feishu_config.json` and fill in your credentials:
-
-```json
-{
-  "app_id": "cli_your_app_id",
-  "app_secret": "your_app_secret",
-  "receive_id": "ou_your_open_id",
-  "receive_id_type": "open_id",
-  "webhook_url": "",
-  "webhook_secret": ""
-}
-```
+Copy `configs/feishu_config.example.json` to `configs/feishu_config.json` and fill in your credentials.
 
 ### 3. Configure Claude Hooks
 
@@ -128,7 +125,7 @@ Add the following hooks to your Claude Code settings:
       "hooks": [
         {
           "type": "command",
-          "command": "python ~/.claude/ccfeishunotify/src/ccfeishunotify.py UserPromptSubmit"
+          "command": "node ~/.claude/ccfeishunotify/src/ccfeishunotify.js UserPromptSubmit"
         }
       ]
     }
@@ -138,7 +135,7 @@ Add the following hooks to your Claude Code settings:
       "hooks": [
         {
           "type": "command",
-          "command": "python ~/.claude/ccfeishunotify/src/ccfeishunotify.py Stop"
+          "command": "node ~/.claude/ccfeishunotify/src/ccfeishunotify.js Stop"
         }
       ]
     }
@@ -148,7 +145,7 @@ Add the following hooks to your Claude Code settings:
       "hooks": [
         {
           "type": "command",
-          "command": "python ~/.claude/ccfeishunotify/src/ccfeishunotify.py Notification"
+          "command": "node ~/.claude/ccfeishunotify/src/ccfeishunotify.js Notification"
         }
       ]
     }
@@ -165,7 +162,7 @@ Add the following hooks to your Claude Code settings:
       "hooks": [
         {
           "type": "command",
-          "command": "python %USERPROFILE%\\.claude\\ccfeishunotify\\src\\ccfeishunotify.py UserPromptSubmit"
+          "command": "node %USERPROFILE%\\.claude\\ccfeishunotify\\src\\ccfeishunotify.js UserPromptSubmit"
         }
       ]
     }
@@ -175,7 +172,7 @@ Add the following hooks to your Claude Code settings:
       "hooks": [
         {
           "type": "command",
-          "command": "python %USERPROFILE%\\.claude\\ccfeishunotify\\src\\ccfeishunotify.py Stop"
+          "command": "node %USERPROFILE%\\.claude\\ccfeishunotify\\src\\ccfeishunotify.js Stop"
         }
       ]
     }
@@ -185,13 +182,15 @@ Add the following hooks to your Claude Code settings:
       "hooks": [
         {
           "type": "command",
-          "command": "python %USERPROFILE%\\.claude\\ccfeishunotify\\src\\ccfeishunotify.py Notification"
+          "command": "node %USERPROFILE%\\.claude\\ccfeishunotify\\src\\ccfeishunotify.js Notification"
         }
       ]
     }
   ]
 }
 ```
+
+Note: The script auto-registers hooks on every invocation, so manual hook configuration is optional. However, it's recommended for first-time setup.
 
 ## Try It Out
 
@@ -205,32 +204,45 @@ You should receive a Feishu card notification when the task completes.
 
 | Event | Card Color | Content |
 |-------|-----------|---------|
-| Task completed (Stop) | Green | Project name, job number, duration, prompt summary |
+| Task completed (Stop) | Green | Project, job number, duration, AI-summarized task understanding, step-by-step execution detail |
 | Permission required | Red | Project name, permission request info |
 | Action required | Orange | Project name, action choice info |
 | Generic notification | Blue | Project name, notification message |
+
+## Card Layout
+
+Each completed task card contains:
+
+1. **Header**: project name with status color
+2. **Task understanding**: AI-summarized Chinese description of what the user asked
+3. **Execution steps**: chronological sections separated by dividers, each containing:
+   - Step number + Chinese description (AI-generated for non-technical readers)
+   - File operations (edit=yellow, new=green, read=grey)
+   - Commands (translated to Chinese)
+4. **Suggestion**: next step recommendation
+5. **Badge row**: status#seq → duration → model → cost → context → timestamp (UTC+8)
 
 ## How It Works
 
 ccfeishunotify tracks Claude sessions and provides Feishu notifications at key moments:
 
-- **When you submit a prompt**: Records the start time and project context in SQLite
-- **When Claude completes**: Calculates duration, sends green card with task summary
+- **When you submit a prompt**: Records the start time and project context in JSON state file
+- **When Claude completes**: Calculates duration, AI-summarizes the prompt for task understanding, organizes execution into chronological steps with Chinese descriptions, sends green card
 - **When Claude needs input/permission**: Sends appropriately colored card immediately
 
-All activity is logged locally in `logs/` and session data is stored in `db/ccfeishunotify.db`. No data is uploaded or shared externally.
+All activity is logged locally in `logs/` and session data is stored in `db/ccfeishunotify_state.json`. No data is uploaded or shared externally.
 
 ## Project Structure
 
 ```
 ccnotify/
 ├── src/                  # Main scripts
-│   └── ccfeishunotify.py # Core notification script
+│   └── ccfeishunotify.js # Core notification script (Node.js)
 ├── configs/              # Configuration files
 │   ├── feishu_config.json
 │   └── feishu_config.example.json
-├── db/                   # Database & queue data
-│   ├── ccfeishunotify.db
+├── db/                   # State & queue data
+│   ├── ccfeishunotify_state.json
 │   └── summary_queue.json
 ├── logs/                 # Log files (auto-rotated daily)
 │   └── ccfeishunotify.log
@@ -246,15 +258,15 @@ ccnotify/
 Expected output:
 ```
 [DEBUG] Found 1 hook commands to execute
-[DEBUG] Executing hook command: ccfeishunotify.py UserPromptSubmit with timeout 60000ms
-[DEBUG] Hook command completed with status 0: ccfeishunotify.py UserPromptSubmit
+[DEBUG] Executing hook command: ccfeishunotify.js UserPromptSubmit with timeout 60000ms
+[DEBUG] Hook command completed with status 0: ccfeishunotify.js UserPromptSubmit
 ```
 
 If you see `Found 0 hook commands`, check for `Invalid settings` errors in your `settings.json`.
 
 2. Ensure Feishu config is correct. Check `ccfeishunotify.log` for error messages:
    - `Tenant access token refreshed successfully` - App mode working
-   - `Feishu notification sent via App mode` - Message delivered
+   - `Feishu card delivered` - Message delivered
    - `Failed to get tenant_access_token` - App credentials incorrect or permissions missing
 
 ## Uninstall
@@ -273,4 +285,3 @@ If you were using the original CCNotify with `terminal-notifier`:
 1. Remove `terminal-notifier` hook commands from `settings.json`
 2. Remove `~/.claude/ccnotify` directory
 3. Follow the CCFeishuNotify installation guide above
-4. The SQLite database format is compatible - old tracking data is not affected
